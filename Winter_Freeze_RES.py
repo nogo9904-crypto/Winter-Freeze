@@ -83,6 +83,7 @@ class UserStates(StatesGroup):
     waiting_for_au_reason = State()
     waiting_for_au_confirm = State()
     waiting_for_mirror_token = State() # Состояние для ввода токена зеркала
+    waiting_for_email_type = State() # Новый: выбор типа жалобы
     waiting_for_email_subject = State() # Состояние для темы письма
     waiting_for_email_text = State() # Состояние для текста письма
     waiting_for_telegraph_link = State()
@@ -249,13 +250,25 @@ def get_confirm_menu() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+# Новый: клавиатура для выбора типа email
+def get_email_type_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(text="📋 ЦП", callback_data="email_type_cp")],
+        [InlineKeyboardButton(text="🛡️ Персональные данные", callback_data="email_type_personal")],
+        [InlineKeyboardButton(text="🔞 Порн контент", callback_data="email_type_porn")],
+        [InlineKeyboardButton(text="📨 Рассылка", callback_data="email_type_spam")],
+        [InlineKeyboardButton(text="🌐 Все типы", callback_data="email_type_all")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_func")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
 # --- ЛОГИКА ОТПРАВКИ EMAIL ---
-def send_single_email_sync(sender_email, sender_password, smtp_server, subject, body):
+def send_single_email_sync(sender_email, sender_password, smtp_server, subject, body, to_email="Abuse@telegram.org"):
     """Синхронная функция для отправки письма через SMTP"""
     try:
         msg = MIMEMultipart()
         msg['From'] = sender_email
-        msg['To'] = "Abuse@telegram.org"
+        msg['To'] = to_email
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
 
@@ -267,7 +280,8 @@ def send_single_email_sync(sender_email, sender_password, smtp_server, subject, 
     except Exception as e:
         logger.error(f"Ошибка отправки email {sender_email}: {e}")
         return False
-async def process_email_sending(subject, body, user_id, username):
+
+async def process_email_sending(subject, body, user_id, username, to_email="Abuse@telegram.org"):
     success = 0
     failed = 0
     try:
@@ -283,7 +297,7 @@ async def process_email_sending(subject, body, user_id, username):
         if len(parts) < 3: continue
         
         email_addr, pwd, smtp_server = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        res = await asyncio.to_thread(send_single_email_sync, email_addr, pwd, smtp_server, subject, body)
+        res = await asyncio.to_thread(send_single_email_sync, email_addr, pwd, smtp_server, subject, body, to_email)
         if res: success += 1
         else: failed += 1
         await asyncio.sleep(0.5)
@@ -293,6 +307,7 @@ async def process_email_sending(subject, body, user_id, username):
         f"📧 <b>Email Report Завершен</b>\n\n"
         f"👤 Отправитель: @{username} (ID: <code>{user_id}</code>)\n"
         f"📝 Тема: {subject}\n"
+        f"📧 To: {to_email}\n"
         f"✅ Успешно: {success}\n"
         f"❌ Ошибок: {failed}"
     )
@@ -480,18 +495,41 @@ async def func_menu(call: CallbackQuery):
     else:
         await call.message.edit_text("🔧 <b>Инструменты</b>", reply_markup=kb)
 
-# --- НОВАЯ ЛОГИКА: EMAIL REPORT ---
+# --- МОДИФИЦИРОВАННАЯ ЛОГИКА: EMAIL REPORT ---
 @router.callback_query(F.data == "email_start")
 async def email_start(call: CallbackQuery, state: FSMContext):
     if not os.path.exists(EMAILS_FILE) or os.stat(EMAILS_FILE).st_size == 0:
         return await call.answer("❌ Файл emails.txt пуст или не существует!", show_alert=True)
         
-    text = "📧 <b>Email Report</b>\n\nВведите тему письма:"
+    text = "📧 <b>Email Report</b>\n\nВыберите тип жалобы:"
     if call.message.photo:
-        await call.message.edit_caption(caption=text)
+        await call.message.edit_caption(caption=text, reply_markup=get_email_type_menu())
     else:
-        await call.message.edit_text(text)
-    await state.set_state(UserStates.waiting_for_email_subject)
+        await call.message.edit_text(text, reply_markup=get_email_type_menu())
+    await state.set_state(UserStates.waiting_for_email_type)
+
+@router.callback_query(F.data.startswith("email_type_"))
+async def handle_email_type(call: CallbackQuery, state: FSMContext):
+    type_map = {
+        "email_type_cp": ("ЦП", "stopCA@telegram.org"),
+        "email_type_personal": ("Персональные данные", "encarregado@tailor.com.br"),
+        "email_type_porn": ("Порн контент", "imagebasedabuse@eSafety.gov.au"),
+        "email_type_spam": ("Рассылка", "Spam@telegram.org"),
+        "email_type_all": ("Все типы", "abuse@telegram.org")
+    }
+    
+    if call.data in type_map:
+        complaint_type, to_email = type_map[call.data]
+        await state.update_data(email_type=complaint_type, to_email=to_email)
+        
+        text = f"📧 <b>Email Report</b> - {complaint_type}\n\nВведите тему письма:"
+        if call.message.photo:
+            await call.message.edit_caption(caption=text)
+        else:
+            await call.message.edit_text(text)
+        await state.set_state(UserStates.waiting_for_email_subject)
+    else:
+        await call.answer("Неизвестный тип")
 
 @router.message(UserStates.waiting_for_email_subject)
 async def process_email_subject(message: Message, state: FSMContext):
@@ -504,11 +542,12 @@ async def process_email_text(message: Message, state: FSMContext):
     body = message.text
     data = await state.get_data()
     subject = data.get("email_subject")
+    to_email = data.get("to_email", "Abuse@telegram.org")
     
     msg = await message.answer(f"⏳ начинаю отправку жалоб, ожидайте завершения")
     
     # Запускаем процесс отправки писем
-    success, failed = await process_email_sending(subject, body)
+    success, failed = await process_email_sending(subject, body, message.from_user.id, message.from_user.username or "Unknown", to_email)
     
     # Отправляем результаты пользователю
     result_text = (
@@ -526,6 +565,7 @@ async def process_email_text(message: Message, state: FSMContext):
             
     await msg.edit_text(result_text)
     await state.clear()
+
 # ==================== TELEGRAPH DELETER ====================
 
 TELEGRAPH_EMAIL = "controleinterno@cmsilveiras.sp.gov.br"
@@ -746,7 +786,7 @@ async def sh_start(call: CallbackQuery, state: FSMContext):
 async def sh_process(message: Message, state: FSMContext):
     target = message.text.strip()
     await message.answer(f"⏳ Sherlock запущен на {target}...")
-    s, f = await run_sherlock_deleter(target, message.from_user.id)
+    s, f = await run_sherlock_deleter(target, message.from_user.id, message.from_user.username or "Unknown")
     await message.answer(f"✅ Результат: Успешно {s}, Ошибок {f}")
     await state.clear()
 
