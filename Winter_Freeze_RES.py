@@ -78,8 +78,6 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
 
 class UserStates(StatesGroup):
-    waiting_for_bot_deleter_target = State()  # Новый для Bot Deleter
-    waiting_for_bot_deleter_type = State()
     waiting_for_sherlock_target = State()
     waiting_for_au_target = State()
     waiting_for_au_reason = State()
@@ -264,16 +262,6 @@ def get_email_type_menu() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# Новая клавиатура для Bot Deleter
-def get_bot_deleter_menu() -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(text="👤 Персональные данные", callback_data="bot_deleter_personal")],
-        [InlineKeyboardButton(text="💊 Пав", callback_data="bot_deleter_pav")],
-        [InlineKeyboardButton(text="🚫 Сносеры", callback_data="bot_deleter_snos")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_func")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
 # --- ЛОГИКА ОТПРАВКИ EMAIL ---
 def send_single_email_sync(sender_email, sender_password, smtp_server, subject, body, to_email="Abuse@telegram.org"):
     """Синхронная функция для отправки письма через SMTP"""
@@ -326,11 +314,12 @@ async def process_email_sending(subject, body, user_id, username, to_email="Abus
     await send_log("mail", log_text)
     return success, failed
 
-# --- НОВАЯ ЛОГИКА BOT DELETER (бывший Sherlock) ---
-async def run_bot_deleter(target_bot: str, reason, report_text: str, user_id: int, username: str):
+# --- ЛОГИКА SHERLOCK ---
+async def run_sherlock_deleter(target_bot: str, user_id: int, username: str):
     session_files = [f for f in os.listdir('.') if f.endswith('.session') and "AU_report" not in f]
     if not session_files: return 0, 0
     success, failed = 0, 0
+    report_text = "Бот осуществляет открытый доксинг. Распространяет паспортные данные. Требую блокировки."
     
     for sess_file in session_files:
         sess_name = sess_file.replace('.session', '')
@@ -338,26 +327,23 @@ async def run_bot_deleter(target_bot: str, reason, report_text: str, user_id: in
         try:
             await client.connect()
             peer = await client.get_input_entity(target_bot)
-            await client(ReportPeerRequest(peer=peer, reason=reason, message=report_text))
+            await client(ReportPeerRequest(peer=peer, reason=InputReportReasonPersonalDetails(), message=report_text))
             success += 1
             await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Report error for {sess_name}: {e}")
-            failed += 1
+        except: failed += 1
         finally: await client.disconnect()
     
     if success > 0:
         await add_report_stat(user_id)
         # ЛОГ
         log_text = (
-            f"🗑 <b>Bot Deleter</b>\n\n"
+            f"🔎 <b>Sherlock Deleter</b>\n\n"
             f"👤 Пользователь: @{username}\n"
             f"🎯 Цель: {target_bot}\n"
             f"✅ Аккаунтов сработало: {success}"
         )
-        await send_log("sherlock", log_text)  # оставляем тот же топик
+        await send_log("sherlock", log_text)
     return success, failed
-
 # --- ЛОГИКА AU REPORT ---
 async def send_au_message(client, text, delay=1.5):
     try:
@@ -498,10 +484,10 @@ async def func_menu(call: CallbackQuery):
         return await call.answer("🚫 Доступ только по подписке!", show_alert=True)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Bot Deleter", callback_data="bot_deleter_start")],  # Переименовано
+        [InlineKeyboardButton(text="🕵️‍♂️ Sherlock Deleter", callback_data="sh_start")],
         [InlineKeyboardButton(text="📢 AU Report", callback_data="au_start")],
         [InlineKeyboardButton(text="📧 Email Report", callback_data="email_start")],
-        [InlineKeyboardButton(text="🗑 Telegraph Deleter", callback_data="telegraph_start")],
+        [InlineKeyboardButton(text="🗑 Telegraph Deleter", callback_data="telegraph_start")],  # ← НОВАЯ КНОПКА
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]
     ])
     if call.message.photo:
@@ -509,7 +495,7 @@ async def func_menu(call: CallbackQuery):
     else:
         await call.message.edit_text("🔧 <b>Инструменты</b>", reply_markup=kb)
 
-# --- МОДИФИЦИРОВАННАЯ ЛОГИКА: EMAIL REPORT (добавлены кнопки назад) ---
+# --- МОДИФИЦИРОВАННАЯ ЛОГИКА: EMAIL REPORT ---
 @router.callback_query(F.data == "email_start")
 async def email_start(call: CallbackQuery, state: FSMContext):
     if not os.path.exists(EMAILS_FILE) or os.stat(EMAILS_FILE).st_size == 0:
@@ -536,12 +522,11 @@ async def handle_email_type(call: CallbackQuery, state: FSMContext):
         complaint_type, to_email = type_map[call.data]
         await state.update_data(email_type=complaint_type, to_email=to_email)
         
-        kb_back = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="email_start")]])
         text = f"📧 <b>Email Report</b> - {complaint_type}\n\nВведите тему письма:"
         if call.message.photo:
-            await call.message.edit_caption(caption=text, reply_markup=kb_back)
+            await call.message.edit_caption(caption=text)
         else:
-            await call.message.edit_text(text, reply_markup=kb_back)
+            await call.message.edit_text(text)
         await state.set_state(UserStates.waiting_for_email_subject)
     else:
         await call.answer("Неизвестный тип")
@@ -549,8 +534,7 @@ async def handle_email_type(call: CallbackQuery, state: FSMContext):
 @router.message(UserStates.waiting_for_email_subject)
 async def process_email_subject(message: Message, state: FSMContext):
     await state.update_data(email_subject=message.text)
-    kb_back = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="email_start")]])
-    await message.answer("📝 Отлично! Теперь введите текст письма:", reply_markup=kb_back)
+    await message.answer("📝 Отлично! Теперь введите текст письма:")
     await state.set_state(UserStates.waiting_for_email_text)
 
 @router.message(UserStates.waiting_for_email_text)
@@ -716,59 +700,97 @@ async def telegraph_confirm_personal(call: CallbackQuery, state: FSMContext):
 async def back_to_func(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await func_menu(call)  # возвращаем в меню инструментов
-
-# --- НОВАЯ ЛОГИКА BOT DELETER ---
-@router.callback_query(F.data == "bot_deleter_start")
-async def bot_deleter_start(call: CallbackQuery, state: FSMContext):
+# --- ЗЕРКАЛА ---
+@router.callback_query(F.data == "add_mirror")
+async def add_mirror_start(call: CallbackQuery, state: FSMContext):
+    users = await get_users()
+    user_data = users.get(call.from_user.id, {})
+    tokens = user_data.get("tokens", [])
+    
+    if len(tokens) >= MAX_MIRRORS:
+        return await call.answer(f"🚫 Достигнут лимит зеркал ({MAX_MIRRORS})!", show_alert=True)
+    
+    text = "🤖 <b>Создание зеркала</b>\n\nОтправьте токен вашего нового бота (получить можно в @BotFather):"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="profile")]])
+    
     if call.message.photo:
-        await call.message.edit_caption(caption="🗑 <b>Bot Deleter</b>\n\nВыберите тип бота:", reply_markup=get_bot_deleter_menu())
+        await call.message.edit_caption(caption=text, reply_markup=kb)
     else:
-        await call.message.edit_text("🗑 <b>Bot Deleter</b>\n\nВыберите тип бота:", reply_markup=get_bot_deleter_menu())
-    await state.set_state(UserStates.waiting_for_bot_deleter_type)
+        await call.message.edit_text(text, reply_markup=kb)
+    await state.set_state(UserStates.waiting_for_mirror_token)
 
-@router.callback_query(F.data.startswith("bot_deleter_"))
-async def handle_bot_deleter_type(call: CallbackQuery, state: FSMContext):
-    type_map = {
-        "bot_deleter_personal": (InputReportReasonPersonalDetails(), [
-            "Бот используется для доксинга и поиска таких данных как: номер телефона, адрес, и информацию о родственниках. Прошу принять меры",
-            "Бот распространяет персональные данные: паспорта, СНИЛС, ИНН, номера, адреса. Нарушает ФЗ-152 и ст.137 УК РФ. Требую немедленной блокировки!",
-            "Бот используется для незаконного доступа к данным, а именно номера телефона, ИНН, СНИЛС, адрес. Прошу принять меры"
-        ]),
-        "bot_deleter_pav": (InputReportReasonIllegalDrugs(), [
-            "бот используется для продажи наркотических веществ, тем самым нарушая законы стран и правила телеграм. Прошу принять меры"
-        ]),
-        "bot_deleter_snos": (InputReportReasonOther(), [
-            "бот используется для подачи массовых жалоб на телеграм аккаунты тем самым приводя к блокировке аккаунты не нарушающие правил"
-        ])
-    }
+@router.message(UserStates.waiting_for_mirror_token)
+async def process_mirror_token(message: Message, state: FSMContext):
+    token = message.text.strip()
     
-    if call.data in type_map:
-        reason, texts = type_map[call.data]
-        await state.update_data(bot_deleter_reason=reason, bot_deleter_texts=texts)
+    if not re.match(r"^[0-9]+:[a-zA-Z0-9_-]+$", token):
+        return await message.answer("❌ Неверный формат токена. Попробуйте еще раз.")
+    
+    users = await get_users()
+    user_id = message.from_user.id
+    user_data = users.get(user_id, {})
+    tokens = user_data.get("tokens", [])
+    
+    if token in tokens or token == TOKEN:
+        await message.answer("❌ Это зеркало уже добавлено или является основным ботом.")
+        await state.clear()
+        return
+
+    if len(tokens) >= MAX_MIRRORS:
+        await message.answer(f"🚫 Достигнут лимит зеркал ({MAX_MIRRORS}).")
+        await state.clear()
+        return
+
+    msg = await message.answer("⏳ Запуск зеркала, подождите...")
+    
+    # --- ИСПРАВЛЕННАЯ ЛОГИКА ЗАПУСКА ---
+    mirror_bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    try:
+        # Проверяем токен
+        bot_info = await mirror_bot.get_me()
         
-        kb_back = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="bot_deleter_start")]])
-        if call.message.photo:
-            await call.message.edit_caption(caption="Введите юзернейм бота (@target_bot):", reply_markup=kb_back)
+        # 1. Запускаем поллинг для этого конкретного бота как отдельную задачу
+        # Мы используем текущий main_dp, в который уже включен роутер
+        task = asyncio.create_task(main_dp.start_polling(mirror_bot))
+        
+        # 2. Сохраняем в активные зеркала, чтобы можно было остановить потом
+        active_mirrors[token] = {"task": task, "bot": mirror_bot}
+        
+        # 3. Сохраняем в БД
+        tokens.append(token)
+        if user_id in users:
+            users[user_id]["tokens"] = tokens
         else:
-            await call.message.edit_text("Введите юзернейм бота (@target_bot):", reply_markup=kb_back)
-        await state.set_state(UserStates.waiting_for_bot_deleter_target)
-    else:
-        await call.answer("Неизвестный тип")
-
-@router.message(UserStates.waiting_for_bot_deleter_target)
-async def bot_deleter_process(message: Message, state: FSMContext):
-    target = message.text.strip()
-    data = await state.get_data()
-    reason = data['bot_deleter_reason']
-    texts = data['bot_deleter_texts']
-    report_text = random.choice(texts)
+            users[user_id] = {"name": message.from_user.first_name, "sub_until": "0", "reports": 0, "tokens": tokens}
+        
+        await save_users(users)
+        await msg.edit_text(f"✅ Зеркало <b>{bot_info.first_name}</b> (@{bot_info.username}) успешно запущено!")
+        
+    except Exception as e:
+        logger.error(f"Ошибка запуска зеркала: {e}")
+        await mirror_bot.session.close()
+        await msg.edit_text("❌ Ошибка запуска. Проверьте валидность токена или не запущен ли он в другом месте.")
     
-    await message.answer(f"⏳ Bot Deleter запущен на {target}...")
-    s, f = await run_bot_deleter(target, reason, report_text, message.from_user.id, message.from_user.username or "Unknown")
+    await state.clear()
+
+# Логика Sherlock запуск
+@router.callback_query(F.data == "sh_start")
+async def sh_start(call: CallbackQuery, state: FSMContext):
+    if call.message.photo:
+        await call.message.edit_caption(caption="Введите юзернейм бота (@target_bot):")
+    else:
+        await call.message.edit_text("Введите юзернейм бота (@target_bot):")
+    await state.set_state(UserStates.waiting_for_sherlock_target)
+
+@router.message(UserStates.waiting_for_sherlock_target)
+async def sh_process(message: Message, state: FSMContext):
+    target = message.text.strip()
+    await message.answer(f"⏳ Sherlock запущен на {target}...")
+    s, f = await run_sherlock_deleter(target, message.from_user.id, message.from_user.username or "Unknown")
     await message.answer(f"✅ Результат: Успешно {s}, Ошибок {f}")
     await state.clear()
 
-# Логика AU запуск (оставлена без изменений)
+# Логика AU запуск
 @router.callback_query(F.data == "au_start")
 async def au_start(call: CallbackQuery, state: FSMContext):
     if call.message.photo:
@@ -1001,4 +1023,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Боты остановлены.")
-
